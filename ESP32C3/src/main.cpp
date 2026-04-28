@@ -16,13 +16,22 @@ enum SystemState {
 // GLOBAL STATE AND TIMING VARIABLES
 // ============================================================================
 SystemState currentState = IDLE;
-unsigned long launchStartTime = 0;      // Time when button was pressed (ms)
+unsigned long launchTime = 0;         // Actual launch time (ms)
 float calculatedBrakeTime = 0.0f;       // Time from launch to apply brake (ms)
 float calculatedLandingTime = 0.0f;     // Time from launch to landing (ms)
 bool brakeActive = false;               // Track if brake has been applied
+bool brakeHasBeenApplied = false;        // Whether braking has been engaged in this cycle
+unsigned long brakeApplyTime = 0;        // When brake was engaged
+float observedFlywheelVelocity = 0.0f;   // Latest flywheel velocity reading
+bool nextJumpTimingsPrepared = false;    // Whether next jump timings have been prepared in IDLE
 
 JumperParams jumper;                    // System parameters
 uint32_t lastStateChangeTime = 0;       // For debug timing
+bool buttonPreviouslyPressed = false;   // Track button edge transitions
+uint32_t lastButtonEventTime = 0;       // For button debounce
+
+const unsigned long BUTTON_DEBOUNCE_MS = 50;   // Debounce and cooldown timing
+const unsigned long RESET_COOLDOWN_MS = 300;
 
 // ============================================================================
 // IQ MODULE CLIENTS
@@ -37,13 +46,15 @@ MultiTurnAngleControlClient multi_control(0);
 // FUNCTION DECLARATIONS
 // ============================================================================
 void initializeSystem();
-void updateStateachine();
+void updateStateMachine();
 void handleIdle();
 void handleCountdown();
 void handleBraking();
 void updateMotorCommand();
 float calculateLandingTime();
 float calculateBrakeTime();
+void prepareNextJumpTimings();
+void printCalculatedTimings(const char* contextLabel);
 void logStateChange(const char* newState);
 void logEvent(const char* event);
 
@@ -123,14 +134,42 @@ void loop() {
 // ============================================================================
 
 void updateStateMachine() {
+  unsigned long currentTime = millis();
   int buttonState = digitalRead(2);
-  unsigned long elapsedTime = millis() - launchStartTime;
-  
+  bool buttonPressed = (buttonState == LOW);
+  bool buttonJustPressed = buttonPressed && !buttonPreviouslyPressed;
+  buttonPreviouslyPressed = buttonPressed;
+
+  if (buttonJustPressed && currentTime - lastButtonEventTime < BUTTON_DEBOUNCE_MS) {
+    buttonJustPressed = false;
+  }
+  if (buttonJustPressed) {
+    lastButtonEventTime = currentTime;
+  }
+
+  long timeFromLaunchMs = (long)currentTime - (long)launchTime;
+
+  // Allow reset from COMPLETE back to IDLE on button press
+  if (currentState == COMPLETE && buttonJustPressed) {
+    currentState = IDLE;
+    launchTime = 0;
+    nextJumpTimingsPrepared = false;
+    logStateChange("IDLE");
+    logEvent("Button pressed - reset to IDLE");
+    calculatedBrakeTime = 0.0f;
+    calculatedLandingTime = 0.0f;
+    brakeActive = false;
+    brakeHasBeenApplied = false;
+    return;
+  }
+
+  bool stateTransitionAllowed = (lastStateChangeTime == 0) || (currentTime - lastStateChangeTime >= RESET_COOLDOWN_MS);
+
   switch (currentState) {
     case IDLE:
       // Button pressed (LOW when using INPUT_PULLUP)
-      if (buttonState == LOW) {
-        launchStartTime = millis();
+      if (buttonJustPressed && stateTransitionAllowed) {
+        launchTime = currentTime + (unsigned long)(SPINUP_TIME * 1000.0f);
         currentState = COUNTDOWN;
         logStateChange("COUNTDOWN");
         logEvent("Button pressed - starting 3s spin-up");
@@ -138,47 +177,68 @@ void updateStateMachine() {
       break;
       
     case COUNTDOWN:
-      // After 3 seconds, transition to braking
-      if (elapsedTime >= SPINUP_TIME * 1000UL) {
+      // When countdown reaches launch, transition to braking
+      if (timeFromLaunchMs >= 0) {
         currentState = BRAKING;
         
         // Calculate landing and brake times
         calculatedLandingTime = calculateLandingTime() * 1000.0f;  // Convert to ms
         calculatedBrakeTime = calculateBrakeTime() * 1000.0f;      // Convert to ms
         brakeActive = false;
+        brakeHasBeenApplied = false;
         
         logStateChange("BRAKING");
-        Serial.print("Calculated landing time: ");
-        Serial.print(calculatedLandingTime, 1);
-        Serial.println(" ms");
-        Serial.print("Calculated brake trigger time: ");
-        Serial.print(calculatedBrakeTime, 1);
-        Serial.println(" ms");
+        logEvent("Launch event - countdown complete");
+        Serial.println("LAUNCH: countdown complete, entering BRAKING state");
+        Serial.print("Braking time (ms): ");
+        Serial.println(calculatedBrakeTime, 1);
+        Serial.print("Landing time (ms): ");
+        Serial.println(calculatedLandingTime, 1);
+        if (calculatedLandingTime <= 0.0f || calculatedBrakeTime <= 0.0f) {
+          Serial.println("WARNING: invalid timing values computed");
+        }
       }
       break;
       
     case BRAKING:
-      // Check if we've reached brake trigger time
-      if (!brakeActive && elapsedTime >= calculatedBrakeTime) {
+      // Apply brake at the calculated time after launch to allow body rotation
+      if (!brakeActive && !brakeHasBeenApplied && timeFromLaunchMs >= (long)calculatedBrakeTime) {
         brakeActive = true;
-        logEvent("Brake applied");
+        brakeHasBeenApplied = true;
+        logEvent("Brake applied at calculated time");
+      }
+
+      // Release brake once the flywheel has stopped
+      if (brakeActive && observedFlywheelVelocity <= BRAKE_VELOCITY_THRESHOLD) {
+        brakeActive = false;
+        logEvent("Brake released after flywheel stopped");
       }
       
       // Check if we've passed landing time (simulation end)
-      if (elapsedTime >= calculatedLandingTime + 500UL) {  // Add 500ms buffer
+      if (timeFromLaunchMs >= (long)(calculatedLandingTime + 500.0f)) {  // Add 500ms buffer
         currentState = COMPLETE;
         logStateChange("COMPLETE");
-        logEvent("Landing event detected - brake disengaged");
+        logEvent("Landing event detected");
       }
       break;
       
     case COMPLETE:
-      // Stay in this state until power cycle or system reset
+      // Stay in this state until restart/reset via button
       break;
   }
 }
 
+void prepareNextJumpTimings() {
+  calculatedLandingTime = calculateLandingTime() * 1000.0f;
+  calculatedBrakeTime = calculateBrakeTime() * 1000.0f;
+  nextJumpTimingsPrepared = true;
+}
+
 void handleIdle() {
+  if (!nextJumpTimingsPrepared) {
+    prepareNextJumpTimings();
+    printCalculatedTimings("Next jump timings");
+  }
   // Idle state: motor off, monitoring button
   // No active control
 }
@@ -194,22 +254,14 @@ void handleBraking() {
   float volts_now = 0.0f;
   float velocity_now = 0.0f;
   
-  // Read system voltages
+  // Read system voltages for diagnostics (no serial output)
   if (ser.get(power.volts_, volts_now)) {
-    // Only log periodically to avoid serial spam
-    static unsigned long lastVoltLog = 0;
-    if (millis() - lastVoltLog > 500) {
-      Serial.print("V: ");
-      Serial.print(volts_now, 2);
-      Serial.println("V");
-      lastVoltLog = millis();
-    }
+    // voltage data available if needed later
   }
   
   // Read flywheel velocity
   if (ser.get(brushless_drive.obs_velocity_, velocity_now)) {
-    // Velocity reading available
-    // Could be used for feedback in future refinements
+    observedFlywheelVelocity = velocity_now;
   }
 }
 
@@ -220,8 +272,8 @@ void handleBraking() {
 void updateMotorCommand() {
   switch (currentState) {
     case IDLE:
-      // Motor off
-      ser.set(multi_control.ctrl_brake_);
+      // Motor not engaged: coast
+      ser.set(multi_control.ctrl_coast_);
       break;
       
     case COUNTDOWN:
@@ -230,20 +282,21 @@ void updateMotorCommand() {
       break;
       
     case BRAKING:
-      // Apply brake when triggered
       if (brakeActive) {
         // Short the motor coils (maximum braking)
         ser.set(multi_control.ctrl_brake_);
+      } else if (brakeHasBeenApplied) {
+        // Brake has been applied and released; coast
+        ser.set(multi_control.ctrl_coast_);
       } else {
-        // Hold current velocity (coast) until brake time
-        // This allows smoother transition to braking
+        // Hold current velocity until brake time
         ser.set(multi_control.ctrl_velocity_, TARGET_VELOCITY);
       }
       break;
       
     case COMPLETE:
-      // Motor off
-      ser.set(multi_control.ctrl_brake_);
+      // Motor off / allow freewheel after landing
+      ser.set(multi_control.ctrl_coast_);
       break;
   }
 }
@@ -339,10 +392,26 @@ float calculateBrakeTime() {
 
 void logStateChange(const char* newState) {
   unsigned long now = millis();
+  lastStateChangeTime = now;
   Serial.print("[");
   Serial.print(now);
   Serial.print(" ms] STATE: ");
   Serial.println(newState);
+}
+
+void printCalculatedTimings(const char* contextLabel) {
+  if (calculatedBrakeTime > 0.0f || calculatedLandingTime > 0.0f) {
+    Serial.print("--- ");
+    Serial.print(contextLabel);
+    Serial.println(" ---");
+    Serial.print("Spin-up time (ms): ");
+    Serial.println(SPINUP_TIME * 1000.0f, 1);
+    Serial.print("Brake trigger time (ms): ");
+    Serial.println(calculatedBrakeTime, 1);
+    Serial.print("Landing time (ms): ");
+    Serial.println(calculatedLandingTime, 1);
+    Serial.println("-------------------------");
+  }
 }
 
 void logEvent(const char* event) {

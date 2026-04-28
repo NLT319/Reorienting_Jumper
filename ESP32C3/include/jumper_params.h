@@ -15,9 +15,9 @@
 
 // Body properties
 const float MB = 0.16f;              // Body mass (kg)
-const float LB = 0.00235f;           // Body length (m)
+const float LB = 1.0f;               // Body length (m)
 const float JB = 0.0f;               // Body moment of inertia (kg*m^2)
-                                      // Pre-calculate: JB = (1/12)*MB*LB^2
+                                     // Pre-calculate: JB = (1/12)*MB*LB^2
 
 // Wheel properties  
 const float MW = 0.02f;              // Wheel mass (kg)
@@ -43,13 +43,13 @@ const float G = 9.81f;               // Gravitational acceleration (m/s^2)
 const float Y0 = 0.0f;               // Initial height of COM relative to goal (m)
 
 // Braking
-const float T_BRAKE = 0.1f;          // Brake application duration (s)
+const float T_BRAKE = 0.5f;          // Brake application duration (s)
 const float BRAKE_VELOCITY_THRESHOLD = 1e-4f;  // Wheel velocity threshold to detect stop (rad/s)
 
 // Spin-up
 const float SPINUP_TIME = 3.0f;      // Time allowed for motor spin-up (s)
 const float TARGET_VELOCITY = 60.0f; // Target motor velocity during spin-up (motor units)
-                                      // This corresponds to desired flywheel angular velocity
+                                     // This corresponds to desired flywheel angular velocity
 
 // ============================================================================
 // DERIVED PARAMETERS (calculated at runtime)
