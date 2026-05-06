@@ -1,4 +1,13 @@
-﻿#include <Arduino.h>
+﻿/*
+
+Add heightened acceleration time requirement for launch condition
+use state machine for launch detection and braking logic
+connect to a python program on pc for real time data and state tracking
+
+*/
+
+
+#include <Arduino.h>
 #include <Wire.h>
 #include <iq_module_communication.hpp>
 #include <JY901.h>
