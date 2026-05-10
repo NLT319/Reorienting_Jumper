@@ -5,7 +5,7 @@
 
 #define I2C_SDA_PIN 8
 #define I2C_SCL_PIN 9
-#define BUTTON_PIN 0
+#define BUTTON_PIN 2
 
 // Motor control mapping
 const float ANGLE_TO_VELOCITY_KP = 2.0f;    // motor units per degree
@@ -45,9 +45,24 @@ float candidateLaunchYaw = 0.0f;
 
 bool lastButtonState = HIGH;
 unsigned long lastButtonTime = 0;
+bool stableButtonState = HIGH;
+bool lastStableButtonState = HIGH;
+unsigned long buttonLastChangeMs = 0;
 
 float computeMotorVelocity(float angleDeg);
 void updateMotorCommand(float velocityCommand);
+
+static inline void resetLaunchState() {
+  launchDetected = false;
+  launchConfirmCount = 0;
+  accelReturnedToAmbient = false;
+  launchSpikeSeen = false;
+  ambientConfirmCount = 0;
+  candidateLaunchTimeMs = 0;
+  candidateLaunchRoll = 0.0f;
+  candidateLaunchPitch = 0.0f;
+  candidateLaunchYaw = 0.0f;
+}
 
 void setup() {
   Serial.begin(115200);
@@ -59,6 +74,9 @@ void setup() {
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   lastButtonState = digitalRead(BUTTON_PIN);
+  stableButtonState = lastButtonState;
+  lastStableButtonState = stableButtonState;
+  buttonLastChangeMs = millis();
 
   ser.begin();
   Serial.println("IQ serial initialized");
@@ -78,17 +96,18 @@ void loop() {
 
   bool buttonState = digitalRead(BUTTON_PIN);
   unsigned long buttonNow = millis();
-  if (buttonState != lastButtonState && (buttonNow - lastButtonTime) > BUTTON_DEBOUNCE_MS) {
-    lastButtonTime = buttonNow;
+  // Debounced stable-state tracking; reset on stable HIGH->LOW transition.
+  if (buttonState != lastButtonState) {
     lastButtonState = buttonState;
-    if (buttonState == LOW) {
-      launchDetected = false;
-      launchConfirmCount = 0;
-      accelReturnedToAmbient = false;
-      launchSpikeSeen = false;
-      ambientConfirmCount = 0;
+    buttonLastChangeMs = buttonNow;
+  }
+  if ((buttonNow - buttonLastChangeMs) > BUTTON_DEBOUNCE_MS && buttonState != stableButtonState) {
+    stableButtonState = buttonState;
+    if (stableButtonState == LOW && lastStableButtonState == HIGH) {
+      resetLaunchState();
       Serial.println("Launch reset: waiting for next launch event.");
     }
+    lastStableButtonState = stableButtonState;
   }
 
   if (!launchDetected) {
