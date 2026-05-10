@@ -1,13 +1,4 @@
-﻿/*
-
-Add heightened acceleration time requirement for launch condition
-use state machine for launch detection and braking logic
-connect to a python program on pc for real time data and state tracking
-
-*/
-
-
-#include <Arduino.h>
+﻿#include <Arduino.h>
 #include <Wire.h>
 #include <iq_module_communication.hpp>
 #include <JY901.h>
@@ -26,6 +17,7 @@ const float ACCEL_SCALE_G = 16.0f / 32768.0f;   // WT901 raw accel to g
 const float LAUNCH_ACCEL_THRESHOLD_G = 2.0f;    // absolute accel threshold for launch burn
 const float AMBIENT_ACCEL_THRESHOLD_G = 1.15f;  // return to near ambient after burn
 const uint8_t LAUNCH_CONFIRM_SAMPLES = 3;
+const uint8_t AMBIENT_CONFIRM_SAMPLES = 3;
 const unsigned long BUTTON_DEBOUNCE_MS = 50;
 
 IqSerial ser(Serial0);
@@ -46,6 +38,10 @@ unsigned long launchTimeMs = 0;
 float launchRoll = 0.0f;
 float launchPitch = 0.0f;
 float launchYaw = 0.0f;
+unsigned long candidateLaunchTimeMs = 0;
+float candidateLaunchRoll = 0.0f;
+float candidateLaunchPitch = 0.0f;
+float candidateLaunchYaw = 0.0f;
 
 bool lastButtonState = HIGH;
 unsigned long lastButtonTime = 0;
@@ -89,29 +85,63 @@ void loop() {
       launchDetected = false;
       launchConfirmCount = 0;
       accelReturnedToAmbient = false;
+      launchSpikeSeen = false;
+      ambientConfirmCount = 0;
       Serial.println("Launch reset: waiting for next launch event.");
     }
   }
 
   if (!launchDetected) {
-    if (currentAccelG <= AMBIENT_ACCEL_THRESHOLD_G) {
-      accelReturnedToAmbient = true;
-    }
+    // State machine:
+    // 1) Require ambient first (sitting on pad / not accelerating)
+    // 2) Detect a sustained high-accel spike (burn)
+    // 3) Declare "launch" at the instant accel returns to ambient (start of ballistic)
 
-    if (accelReturnedToAmbient && currentAccelG >= LAUNCH_ACCEL_THRESHOLD_G) {
-      launchConfirmCount++;
-    } else if (currentAccelG < LAUNCH_ACCEL_THRESHOLD_G) {
-      launchConfirmCount = 0;
-    }
+    if (!accelReturnedToAmbient) {
+      if (currentAccelG <= AMBIENT_ACCEL_THRESHOLD_G) {
+        ambientConfirmCount++;
+        if (ambientConfirmCount >= AMBIENT_CONFIRM_SAMPLES) {
+          accelReturnedToAmbient = true;
+          ambientConfirmCount = 0;
+        }
+      } else {
+        ambientConfirmCount = 0;
+      }
+    } else if (!launchSpikeSeen) {
+      if (currentAccelG >= LAUNCH_ACCEL_THRESHOLD_G) {
+        launchConfirmCount++;
+        if (launchConfirmCount >= LAUNCH_CONFIRM_SAMPLES) {
+          launchSpikeSeen = true;
+          launchConfirmCount = 0;
+          ambientConfirmCount = 0;
+          Serial.println("Burn detected: waiting for accel to return to ambient for ballistic launch.");
+        }
+      } else {
+        launchConfirmCount = 0;
+      }
+    } else {
+      // Burn already detected: wait for return-to-ambient (ballistic start).
+      if (currentAccelG <= AMBIENT_ACCEL_THRESHOLD_G) {
+        if (ambientConfirmCount == 0) {
+          candidateLaunchTimeMs = millis();
+          candidateLaunchRoll = currentRoll;
+          candidateLaunchPitch = currentPitch;
+          candidateLaunchYaw = currentYaw;
+        }
 
-    if (launchConfirmCount >= LAUNCH_CONFIRM_SAMPLES) {
-      launchDetected = true;
-      launchTimeMs = millis();
-      launchRoll = currentRoll;
-      launchPitch = currentPitch;
-      launchYaw = currentYaw;
-      Serial.printf("Launch detected at %lu ms: roll=%.2f pitch=%.2f yaw=%.2f accel=%.2f g\n",
-                    launchTimeMs, launchRoll, launchPitch, launchYaw, currentAccelG);
+        ambientConfirmCount++;
+        if (ambientConfirmCount >= AMBIENT_CONFIRM_SAMPLES) {
+          launchDetected = true;
+          launchTimeMs = candidateLaunchTimeMs;
+          launchRoll = candidateLaunchRoll;
+          launchPitch = candidateLaunchPitch;
+          launchYaw = candidateLaunchYaw;
+          Serial.printf("Launch (ballistic) detected at %lu ms: roll=%.2f pitch=%.2f yaw=%.2f accel=%.2f g\n",
+                        launchTimeMs, launchRoll, launchPitch, launchYaw, currentAccelG);
+        }
+      } else {
+        ambientConfirmCount = 0;
+      }
     }
   }
 
