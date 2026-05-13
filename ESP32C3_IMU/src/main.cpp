@@ -6,10 +6,11 @@
 #define I2C_SDA_PIN 8
 #define I2C_SCL_PIN 9
 #define BUTTON_PIN 2
+// Motor IDs 0, 1
 
 // Motor control mapping
 const float ANGLE_TO_VELOCITY_KP = 2.0f;    // motor units per degree
-const float MAX_MOTOR_VELOCITY = 80.0f;     // motor units
+const float MAX_MOTOR_VELOCITY = 150.0f;     // motor units
 const float ANGLE_DEADBAND_DEG = 1.5f;      // deadband around level
 const unsigned long TELEMETRY_INTERVAL_MS = 200;
 
@@ -21,7 +22,8 @@ const uint8_t AMBIENT_CONFIRM_SAMPLES = 3;
 const unsigned long BUTTON_DEBOUNCE_MS = 50;
 
 IqSerial ser(Serial0);
-MultiTurnAngleControlClient multi_control(0);
+MultiTurnAngleControlClient pitch_control(1);  // Motor 1: pitch control
+MultiTurnAngleControlClient roll_control(0);   // Motor 0: roll control
 
 float currentRoll = 0.0f;
 float currentPitch = 0.0f;
@@ -50,7 +52,7 @@ bool lastStableButtonState = HIGH;
 unsigned long buttonLastChangeMs = 0;
 
 float computeMotorVelocity(float angleDeg);
-void updateMotorCommand(float velocityCommand);
+void updateMotorCommand(float pitchVelocity, float rollVelocity);
 
 static inline void resetLaunchState() {
   launchDetected = false;
@@ -66,6 +68,7 @@ static inline void resetLaunchState() {
 
 void setup() {
   Serial.begin(115200);
+  resetLaunchState();
   delay(500);
   Serial.println("ESP32C3 WT901B IMU motor control starting...");
 
@@ -164,18 +167,21 @@ void loop() {
     }
   }
 
-  float velocityCommand = 0.0f;
+  float pitchVelocity = 0.0f;
+  float rollVelocity  = 0.0f;
   if (launchDetected) {
-    velocityCommand = computeMotorVelocity(currentPitch);
+    pitchVelocity = computeMotorVelocity(currentPitch);
+    rollVelocity  = computeMotorVelocity(currentRoll);
   }
-  updateMotorCommand(velocityCommand);
+  updateMotorCommand(pitchVelocity, rollVelocity);
 
   unsigned long now = millis();
   if (now - lastTelemetryTime >= TELEMETRY_INTERVAL_MS) {
     lastTelemetryTime = now;
-    Serial.printf("IMU angles: roll=%.2f pitch=%.2f yaw=%.2f accel=%.2f g -> target vel=%.1f %s\n",
+    Serial.printf("IMU angles: roll=%.2f pitch=%.2f yaw=%.2f accel=%.2f g -> pitch_vel=%.1f roll_vel=%.1f %s\n",
                   currentRoll, currentPitch, currentYaw, currentAccelG,
-                  velocityCommand, launchDetected ? "[LAUNCHED]" : "[WAITING]" );
+                  pitchVelocity, rollVelocity,
+                  launchDetected ? "[LAUNCHED]" : "[WAITING]");
   }
 }
 
@@ -188,6 +194,7 @@ float computeMotorVelocity(float angleDeg) {
   return velocity;
 }
 
-void updateMotorCommand(float velocityCommand) {
-  ser.set(multi_control.ctrl_velocity_, velocityCommand);
+void updateMotorCommand(float pitchVelocity, float rollVelocity) {
+  ser.set(pitch_control.ctrl_velocity_, pitchVelocity);  // Motor 1: pitch
+  ser.set(roll_control.ctrl_velocity_,  rollVelocity);   // Motor 0: roll
 }
