@@ -6,29 +6,26 @@
 #define I2C_SDA_PIN 8
 #define I2C_SCL_PIN 9
 #define BUTTON_PIN 2
-// Motor IDs 0, 1
 
-// Motor control mapping
-const float ANGLE_TO_VELOCITY_KP = 2.0f;    // motor units per degree
-const float MAX_MOTOR_VELOCITY = 150.0f;     // motor units
-const float ANGLE_DEADBAND_DEG = 1.5f;      // deadband around level
+const float ANGLE_TO_VELOCITY_KP = 0.1f;
+const float MAX_MOTOR_VELOCITY = 150.0f;
+const float ANGLE_DEADBAND_DEG = 1.5f;
 const unsigned long TELEMETRY_INTERVAL_MS = 200;
 
-const float ACCEL_SCALE_G = 16.0f / 32768.0f;   // WT901 raw accel to g
-const float LAUNCH_ACCEL_THRESHOLD_G = 2.0f;    // absolute accel threshold for launch burn
-const float AMBIENT_ACCEL_THRESHOLD_G = 1.15f;  // return to near ambient after burn
+const float ACCEL_SCALE_G = 16.0f / 32768.0f;
+const float LAUNCH_ACCEL_THRESHOLD_G = 3.0f;
+const float AMBIENT_ACCEL_THRESHOLD_G = 1.15f;
 const uint8_t LAUNCH_CONFIRM_SAMPLES = 3;
 const uint8_t AMBIENT_CONFIRM_SAMPLES = 3;
 const unsigned long BUTTON_DEBOUNCE_MS = 50;
 
 IqSerial ser(Serial0);
-MultiTurnAngleControlClient pitch_control(1);  // Motor 1: pitch control
-MultiTurnAngleControlClient roll_control(0);   // Motor 0: roll control
+MultiTurnAngleControlClient pitch_control(1);  // Motor 1: axis between -Z and -X
+MultiTurnAngleControlClient roll_control(0);   // Motor 0: axis between -Z and +X
 
-float currentRoll = 0.0f;
-float currentPitch = 0.0f;
-float currentYaw = 0.0f;
 float currentAccelG = 0.0f;
+float exTilt = 0.0f;
+float ezTilt = 0.0f;
 bool accelReturnedToAmbient = false;
 bool launchSpikeSeen = false;
 uint8_t ambientConfirmCount = 0;
@@ -37,22 +34,18 @@ unsigned long lastTelemetryTime = 0;
 bool launchDetected = false;
 uint8_t launchConfirmCount = 0;
 unsigned long launchTimeMs = 0;
-float launchRoll = 0.0f;
-float launchPitch = 0.0f;
-float launchYaw = 0.0f;
+float launchAngle1 = 0.0f;
+float launchAngle2 = 0.0f;
 unsigned long candidateLaunchTimeMs = 0;
-float candidateLaunchRoll = 0.0f;
-float candidateLaunchPitch = 0.0f;
-float candidateLaunchYaw = 0.0f;
+float candidateAngle1 = 0.0f;
+float candidateAngle2 = 0.0f;
 
 bool lastButtonState = HIGH;
-unsigned long lastButtonTime = 0;
 bool stableButtonState = HIGH;
 bool lastStableButtonState = HIGH;
 unsigned long buttonLastChangeMs = 0;
 
-float computeMotorVelocity(float angleDeg);
-void updateMotorCommand(float pitchVelocity, float rollVelocity);
+void updateMotorCommand(float ex, float ez);
 
 static inline void resetLaunchState() {
   launchDetected = false;
@@ -61,9 +54,8 @@ static inline void resetLaunchState() {
   launchSpikeSeen = false;
   ambientConfirmCount = 0;
   candidateLaunchTimeMs = 0;
-  candidateLaunchRoll = 0.0f;
-  candidateLaunchPitch = 0.0f;
-  candidateLaunchYaw = 0.0f;
+  candidateAngle1 = 0.0f;
+  candidateAngle2 = 0.0f;
 }
 
 void setup() {
@@ -86,20 +78,22 @@ void setup() {
 }
 
 void loop() {
-  JY901.GetAngle();
-  currentRoll  = (float)JY901.stcAngle.Angle[0] / 32768.0f * 180.0f;
-  currentPitch = (float)JY901.stcAngle.Angle[1] / 32768.0f * 180.0f;
-  currentYaw   = (float)JY901.stcAngle.Angle[2] / 32768.0f * 180.0f;
-
   JY901.GetAcc();
   float ax = (float)JY901.stcAcc.a[0] * ACCEL_SCALE_G;
   float ay = (float)JY901.stcAcc.a[1] * ACCEL_SCALE_G;
   float az = (float)JY901.stcAcc.a[2] * ACCEL_SCALE_G;
   currentAccelG = sqrtf(ax * ax + ay * ay + az * az);
 
+  // Derive tilt directly from accelerometer in Y-up frame.
+  // When upright: ay ~ +1g, ax ~ 0, az ~ 0 → xTilt = 0, zTilt = 0.
+  // atan2(ax, ay): positive ax → positive xTilt (tilt around X axis)
+  // atan2(az, ay): positive az → positive zTilt (tilt around Z axis)
+  float xTilt = atan2f(ax, ay) * 180.0f / M_PI;
+  float zTilt = atan2f(az, ay) * 180.0f / M_PI;
+
+  // --- Button debounce & launch reset ---
   bool buttonState = digitalRead(BUTTON_PIN);
   unsigned long buttonNow = millis();
-  // Debounced stable-state tracking; reset on stable HIGH->LOW transition.
   if (buttonState != lastButtonState) {
     lastButtonState = buttonState;
     buttonLastChangeMs = buttonNow;
@@ -113,12 +107,8 @@ void loop() {
     lastStableButtonState = stableButtonState;
   }
 
+  // --- Launch detection state machine ---
   if (!launchDetected) {
-    // State machine:
-    // 1) Require ambient first (sitting on pad / not accelerating)
-    // 2) Detect a sustained high-accel spike (burn)
-    // 3) Declare "launch" at the instant accel returns to ambient (start of ballistic)
-
     if (!accelReturnedToAmbient) {
       if (currentAccelG <= AMBIENT_ACCEL_THRESHOLD_G) {
         ambientConfirmCount++;
@@ -142,24 +132,20 @@ void loop() {
         launchConfirmCount = 0;
       }
     } else {
-      // Burn already detected: wait for return-to-ambient (ballistic start).
       if (currentAccelG <= AMBIENT_ACCEL_THRESHOLD_G) {
         if (ambientConfirmCount == 0) {
           candidateLaunchTimeMs = millis();
-          candidateLaunchRoll = currentRoll;
-          candidateLaunchPitch = currentPitch;
-          candidateLaunchYaw = currentYaw;
+          candidateAngle1 = xTilt;
+          candidateAngle2 = zTilt;
         }
-
         ambientConfirmCount++;
         if (ambientConfirmCount >= AMBIENT_CONFIRM_SAMPLES) {
           launchDetected = true;
           launchTimeMs = candidateLaunchTimeMs;
-          launchRoll = candidateLaunchRoll;
-          launchPitch = candidateLaunchPitch;
-          launchYaw = candidateLaunchYaw;
-          Serial.printf("Launch (ballistic) detected at %lu ms: roll=%.2f pitch=%.2f yaw=%.2f accel=%.2f g\n",
-                        launchTimeMs, launchRoll, launchPitch, launchYaw, currentAccelG);
+          launchAngle1 = candidateAngle1;
+          launchAngle2 = candidateAngle2;
+          Serial.printf("Launch (ballistic) detected at %lu ms: X-tilt=%.2f Z-tilt=%.2f accel=%.2f g\n",
+                        launchTimeMs, launchAngle1, launchAngle2, currentAccelG);
         }
       } else {
         ambientConfirmCount = 0;
@@ -167,34 +153,35 @@ void loop() {
     }
   }
 
-  float pitchVelocity = 0.0f;
-  float rollVelocity  = 0.0f;
+  // --- Motor control ---
+  // Motor 1 axis (-X -Z)/sqrt2: cmd1 = Kp * (-ex - ez)
+  // Motor 0 axis (+X -Z)/sqrt2: cmd0 = Kp * ( ex - ez)
+  // sqrt(2) absorbed into KP. Flip signs per axis if motor response is reversed.
+  exTilt = 0.0f;
+  ezTilt = 0.0f;
   if (launchDetected) {
-    pitchVelocity = computeMotorVelocity(currentPitch);
-    rollVelocity  = computeMotorVelocity(currentRoll);
+    exTilt = (fabs(xTilt) >= ANGLE_DEADBAND_DEG) ? xTilt : 0.0f;
+    ezTilt = (fabs(zTilt) >= ANGLE_DEADBAND_DEG) ? zTilt : 0.0f;
   }
-  updateMotorCommand(pitchVelocity, rollVelocity);
+  updateMotorCommand(exTilt, ezTilt);
 
   unsigned long now = millis();
   if (now - lastTelemetryTime >= TELEMETRY_INTERVAL_MS) {
     lastTelemetryTime = now;
-    Serial.printf("IMU angles: roll=%.2f pitch=%.2f yaw=%.2f accel=%.2f g -> pitch_vel=%.1f roll_vel=%.1f %s\n",
-                  currentRoll, currentPitch, currentYaw, currentAccelG,
-                  pitchVelocity, rollVelocity,
+    float cmd1 = constrain(ANGLE_TO_VELOCITY_KP * (-exTilt - ezTilt), -MAX_MOTOR_VELOCITY, MAX_MOTOR_VELOCITY);
+    float cmd0 = constrain(ANGLE_TO_VELOCITY_KP * ( exTilt - ezTilt), -MAX_MOTOR_VELOCITY, MAX_MOTOR_VELOCITY);
+    Serial.printf("IMU: X-tilt=%.2f Z-tilt=%.2f accel=%.2f g -> motor1=%.1f motor0=%.1f %s\n",
+                  xTilt, zTilt, currentAccelG,
+                  cmd1, cmd0,
                   launchDetected ? "[LAUNCHED]" : "[WAITING]");
   }
 }
 
-float computeMotorVelocity(float angleDeg) {
-  if (fabs(angleDeg) < ANGLE_DEADBAND_DEG) {
-    return 0.0f;
-  }
-  float velocity = ANGLE_TO_VELOCITY_KP * angleDeg;
-  velocity = constrain(velocity, -MAX_MOTOR_VELOCITY, MAX_MOTOR_VELOCITY);
-  return velocity;
-}
-
-void updateMotorCommand(float pitchVelocity, float rollVelocity) {
-  ser.set(pitch_control.ctrl_velocity_, pitchVelocity);  // Motor 1: pitch
-  ser.set(roll_control.ctrl_velocity_,  rollVelocity);   // Motor 0: roll
+void updateMotorCommand(float ex, float ez) {
+  // Motor 1 axis: (-X -Z)/sqrt2
+  // Motor 0 axis: (+X -Z)/sqrt2
+  float cmd1 = constrain(ANGLE_TO_VELOCITY_KP * (-ex - ez), -MAX_MOTOR_VELOCITY, MAX_MOTOR_VELOCITY);
+  float cmd0 = constrain(ANGLE_TO_VELOCITY_KP * ( ex - ez), -MAX_MOTOR_VELOCITY, MAX_MOTOR_VELOCITY);
+  ser.set(pitch_control.ctrl_velocity_, cmd1);  // Motor 1
+  ser.set(roll_control.ctrl_velocity_,  cmd0);  // Motor 0
 }
