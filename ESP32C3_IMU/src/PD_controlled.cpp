@@ -2,6 +2,7 @@
 #include <Wire.h>
 #include <iq_module_communication.hpp>
 #include <JY901.h>
+#include "pd_controlled.h"
 
 #define I2C_SDA_PIN 8
 #define I2C_SCL_PIN 9
@@ -139,7 +140,7 @@ static inline void resetLaunchState() {
   lastVelUpdateUs       = 0;
 }
 
-void setup() {
+void pd_setup() {
   Serial.begin(115200);
   resetLaunchState();
   delay(500);
@@ -158,7 +159,7 @@ void setup() {
   Serial.println("IQ serial initialized");
 }
 
-void loop() {
+void pd_loop() {
   // --- Read accelerometer ---
   JY901.GetAcc();
   float ax = (float)JY901.stcAcc.a[0] * ACCEL_SCALE_G;
@@ -172,24 +173,28 @@ void loop() {
   float wy = (float)JY901.stcGyro.w[1] * GYRO_SCALE_DPS;
   float wz = (float)JY901.stcGyro.w[2] * GYRO_SCALE_DPS;
 
-  // --- Read IMU quaternion (pre-launch only, for gravity capture) ---
-  // q[0]=w, q[1]=x, q[2]=y, q[3]=z, scaled /32768
+  // --- Read IMU quaternion (idle + acceleration phase, for gravity capture & burnout snapshot) ---
+  // Quaternion: q[0]=w, q[1]=x, q[2]=y, q[3]=z, scaled /32768
   if (!launchDetected) {
-    JY901.GetQuat();
+    JY901.GetQuaternion();
     Quat q_imu = quatNorm(Quat{
-      (float)JY901.stcQuat.q[0] * QUAT_SCALE,
-      (float)JY901.stcQuat.q[1] * QUAT_SCALE,
-      (float)JY901.stcQuat.q[2] * QUAT_SCALE,
-      (float)JY901.stcQuat.q[3] * QUAT_SCALE
+      (float)JY901.stcQuater.q0 * QUAT_SCALE,
+      (float)JY901.stcQuater.q1 * QUAT_SCALE,
+      (float)JY901.stcQuater.q2 * QUAT_SCALE,
+      (float)JY901.stcQuater.q3 * QUAT_SCALE
     });
-    // Gravity in sensor body frame is -Y (Y-up mounting).
-    // Rotate to world frame to capture true down direction regardless of launch angle.
-    Vec3 bodyDown = {0, -1, 0};
-    Vec3 g = quatRotVec(q_imu, bodyDown);
-    float gLen = sqrtf(g.x*g.x + g.y*g.y + g.z*g.z);
-    if (gLen > 1e-6f) gravity_world = {g.x/gLen, g.y/gLen, g.z/gLen};
 
-    // Also snapshot the quaternion continuously as launch candidate
+    // At rest, accelerometer reads body +Y ≈ +1g (specific force, "up").
+    // Rotate that into world, then negate to get gravity_world (unit "down" direction).
+    Vec3 bodyUp = {0, 1, 0};
+    Vec3 up_world = quatRotVec(q_imu, bodyUp);
+    float uLen = sqrtf(up_world.x*up_world.x + up_world.y*up_world.y + up_world.z*up_world.z);
+    if (uLen > 1e-6f) {
+      up_world = {up_world.x/uLen, up_world.y/uLen, up_world.z/uLen};
+      gravity_world = {-up_world.x, -up_world.y, -up_world.z};
+    }
+
+    // Snapshot the quaternion continuously as launch candidate
     candidateQuat = q_imu;
   }
 
@@ -228,12 +233,34 @@ void loop() {
           launchSpikeSeen = true;
           launchConfirmCount = 0;
           ambientConfirmCount = 0;
-          Serial.println("Burn detected: waiting for accel to return to ambient for ballistic launch.");
+          // Begin integrating velocity over the acceleration phase only.
+          vel_world = {0,0,0};
+          lastVelUpdateUs = micros();
+          Serial.println("Burn detected: integrating velocity until accel returns to ambient for ballistic launch.");
         }
       } else {
         launchConfirmCount = 0;
       }
     } else {
+      // --- Acceleration phase: integrate world-frame velocity ---
+      // accel_* is specific force (in g). Linear acceleration = specific_force_world + gravity_world.
+      // gravity_world is unit "down". At rest: specific_force_world ≈ -gravity_world -> linear ≈ 0.
+      unsigned long nowUs = micros();
+      float dt = (nowUs - lastVelUpdateUs) * 1e-6f;
+      lastVelUpdateUs = nowUs;
+      if (dt > 0.0f && dt < 0.05f) {
+        Vec3 accel_body_g = {ax, ay, az};
+        Vec3 specific_force_world_g = quatRotVec(candidateQuat, accel_body_g);
+        Vec3 linear_accel_world_mps2 = {
+          (specific_force_world_g.x + gravity_world.x) * G_MPS2,
+          (specific_force_world_g.y + gravity_world.y) * G_MPS2,
+          (specific_force_world_g.z + gravity_world.z) * G_MPS2
+        };
+        vel_world.x += linear_accel_world_mps2.x * dt;
+        vel_world.y += linear_accel_world_mps2.y * dt;
+        vel_world.z += linear_accel_world_mps2.z * dt;
+      }
+
       if (currentAccelG <= AMBIENT_ACCEL_THRESHOLD_G) {
         if (ambientConfirmCount == 0) {
           candidateLaunchTimeMs = millis();
@@ -247,12 +274,9 @@ void loop() {
           // Initialize body quaternion from IMU snapshot at burnout
           q_body = candidateQuat;
 
-          // Initial velocity direction = body +Y rotated to world frame
-          Vec3 bodyUp = {0, 1, 0};
-          Vec3 vd = quatRotVec(q_body, bodyUp);
-          float vLen = sqrtf(vd.x*vd.x + vd.y*vd.y + vd.z*vd.z);
-          velDir_world = (vLen > 1e-6f) ? Vec3{vd.x/vLen, vd.y/vLen, vd.z/vLen} : Vec3{0,1,0};
-          vel_world    = velDir_world;  // unit magnitude; only direction matters
+          // vel_world has been integrated over the acceleration phase; use it as initial ballistic velocity.
+          float vLen = sqrtf(vel_world.x*vel_world.x + vel_world.y*vel_world.y + vel_world.z*vel_world.z);
+          velDir_world = (vLen > 1e-6f) ? Vec3{vel_world.x/vLen, vel_world.y/vLen, vel_world.z/vLen} : Vec3{0,1,0};
 
           lastGyroUpdateUs = micros();
           lastVelUpdateUs  = micros();
