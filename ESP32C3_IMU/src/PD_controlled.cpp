@@ -4,15 +4,18 @@
 #include <JY901.h>
 #include "pd_controlled.h"
 
+namespace {
+
 #define I2C_SDA_PIN 8
 #define I2C_SCL_PIN 9
 #define BUTTON_PIN 2
 
 // --- Tunable gains ---
-const float KP                    = 0.1f;    // proportional: motor units per degree of attitude error
+const float KP                    = 2.5f;    // proportional: motor units per degree of attitude error
 const float KD                    = 0.01f;   // derivative: motor units per deg/s of body rate
 const float MAX_MOTOR_VELOCITY    = 150.0f;
 const float ANGLE_DEADBAND_DEG    = 1.5f;
+const float TARGET_BODY_Y_SIGN     = -1.0f;   // +1: body +Y points along velocity, -1: body -Y points along velocity
 const unsigned long TELEMETRY_INTERVAL_MS = 200;
 
 // --- IMU scaling ---
@@ -29,8 +32,8 @@ const uint8_t AMBIENT_CONFIRM_SAMPLES = 3;
 const unsigned long BUTTON_DEBOUNCE_MS = 50;
 
 IqSerial ser(Serial0);
-MultiTurnAngleControlClient pitch_control(1);  // Motor 1: axis between -Z and -X
-MultiTurnAngleControlClient roll_control(0);   // Motor 0: axis between -Z and +X
+MultiTurnAngleControlClient pitch_control(1);  // Motor axis between -Z and -X
+MultiTurnAngleControlClient roll_control(0);   // Motor axis between -Z and +X
 
 // --- Math types ---
 struct Vec3 { float x, y, z; };
@@ -140,7 +143,7 @@ static inline void resetLaunchState() {
   lastVelUpdateUs       = 0;
 }
 
-void pd_setup() {
+void pd_setup_impl() {
   Serial.begin(115200);
   resetLaunchState();
   delay(500);
@@ -159,7 +162,7 @@ void pd_setup() {
   Serial.println("IQ serial initialized");
 }
 
-void pd_loop() {
+void pd_loop_impl() {
   // --- Read accelerometer ---
   JY901.GetAcc();
   float ax = (float)JY901.stcAcc.a[0] * ACCEL_SCALE_G;
@@ -315,9 +318,12 @@ void pd_loop() {
     float vLen = sqrtf(vel_world.x*vel_world.x + vel_world.y*vel_world.y + vel_world.z*vel_world.z);
     if (vLen > 1e-3f) velDir_world = {vel_world.x/vLen, vel_world.y/vLen, vel_world.z/vLen};
 
-    // 4. Target: body -Y (base/foot) points along velocity direction
-    //    i.e. body +Y points opposite to velocity
-    Vec3 targetBodyY = { -velDir_world.x, -velDir_world.y, -velDir_world.z };
+    // 4. Target: selected body Y direction points along velocity direction.
+    Vec3 targetBodyY = {
+      TARGET_BODY_Y_SIGN * velDir_world.x,
+      TARGET_BODY_Y_SIGN * velDir_world.y,
+      TARGET_BODY_Y_SIGN * velDir_world.z
+    };
 
     // 5. Current body +Y in world frame
     Vec3 currentBodyY = quatRotVec(q_body, Vec3{0,1,0});
@@ -369,6 +375,16 @@ void updateMotorCommand(float ex, float ez, float wx, float wz) {
   // sqrt(2) absorbed into KP/KD
   float cmd1 = constrain(KP*(-ex - ez) - KD*(-wx - wz), -MAX_MOTOR_VELOCITY, MAX_MOTOR_VELOCITY);
   float cmd0 = constrain(KP*( ex - ez) - KD*( wx - wz), -MAX_MOTOR_VELOCITY, MAX_MOTOR_VELOCITY);
-  ser.set(pitch_control.ctrl_velocity_, cmd1);  // Motor 1
-  ser.set(roll_control.ctrl_velocity_,  cmd0);  // Motor 0
+  ser.set(pitch_control.ctrl_velocity_, cmd1);
+  ser.set(roll_control.ctrl_velocity_,  -cmd0);
+}
+
+}
+
+void pd_setup() {
+  pd_setup_impl();
+}
+
+void pd_loop() {
+  pd_loop_impl();
 }
