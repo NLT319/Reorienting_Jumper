@@ -3,6 +3,7 @@
 #include <iq_module_communication.hpp>
 #include <JY901.h>
 #include "pd_controlled.h"
+#include "telemetry.h"
 
 namespace {
 
@@ -11,11 +12,14 @@ namespace {
 #define BUTTON_PIN 2
 
 // --- Tunable gains ---
-const float KP                    = 2.5f;    // proportional: motor units per degree of attitude error
-const float KD                    = 0.01f;   // derivative: motor units per deg/s of body rate
-const float MAX_MOTOR_VELOCITY    = 150.0f;
+const float KP                    = 2.0f;    // proportional: motor units per degree of attitude error
+const float KD                    = 0.08f;   // derivative: motor units per deg/s of body rate
+const float MAX_MOTOR_VELOCITY    = 199.0f;
 const float ANGLE_DEADBAND_DEG    = 1.5f;
-const float TARGET_BODY_Y_SIGN     = -1.0f;   // +1: body +Y points along velocity, -1: body -Y points along velocity
+
+// flip to + for body flip behavior
+const float TARGET_BODY_Y_SIGN     = 1.0f;   // +1: body +Y points along velocity, -1: body -Y points along velocity
+const float MIN_INTEGRATED_LAUNCH_SPEED_MPS = 0.25f;
 const unsigned long TELEMETRY_INTERVAL_MS = 200;
 
 // --- IMU scaling ---
@@ -32,12 +36,30 @@ const uint8_t AMBIENT_CONFIRM_SAMPLES = 3;
 const unsigned long BUTTON_DEBOUNCE_MS = 50;
 
 IqSerial ser(Serial0);
-MultiTurnAngleControlClient pitch_control(1);  // Motor axis between -Z and -X
-MultiTurnAngleControlClient roll_control(0);   // Motor axis between -Z and +X
+MultiTurnAngleControlClient pitch_control(0);  // Motor axis between -Z and -X
+MultiTurnAngleControlClient roll_control(1);   // Motor axis between -Z and +X
 
 // --- Math types ---
 struct Vec3 { float x, y, z; };
 struct Quat { float w, x, y, z; };
+
+static float vecDot(Vec3 a, Vec3 b) {
+  return a.x*b.x + a.y*b.y + a.z*b.z;
+}
+
+static float vecNorm(Vec3 v) {
+  return sqrtf(v.x*v.x + v.y*v.y + v.z*v.z);
+}
+
+static Vec3 vecScale(Vec3 v, float s) {
+  return {v.x*s, v.y*s, v.z*s};
+}
+
+static Vec3 vecNormalizeOrFallback(Vec3 v, Vec3 fallback) {
+  float n = vecNorm(v);
+  if (n < 1e-6f) return fallback;
+  return {v.x/n, v.y/n, v.z/n};
+}
 
 static Quat quatMul(Quat p, Quat q) {
   return {
@@ -108,7 +130,16 @@ unsigned long lastGyroUpdateUs = 0;
 // World-frame velocity vector, gravity-integrated from burnout
 Vec3 vel_world   = {0,0,0};
 Vec3 velDir_world = {0,1,0};
+Vec3 launchAxis_world = {0,1,0};
+float lastBallisticDt = 0.0f;
+float lastBallisticSpeed = 0.0f;
 unsigned long lastVelUpdateUs = 0;
+// Diagnostic: last measured accel and specific force (g)
+Vec3 lastAccelBody_g = {0,0,0};
+Vec3 lastSpecificForceWorld_g = {0,0,0};
+// Diagnostic: last applied linear acceleration (m/s^2) and delta-velocity (m/s)
+Vec3 lastLinearAccel_mps2 = {0,0,0};
+Vec3 lastDeltaVel_mps = {0,0,0};
 
 bool accelReturnedToAmbient = false;
 bool launchSpikeSeen = false;
@@ -127,6 +158,7 @@ bool lastStableButtonState = HIGH;
 unsigned long buttonLastChangeMs = 0;
 
 void updateMotorCommand(float ex, float ez, float wx, float wz);
+void computeMotorCommands(float ex, float ez, float wx, float wz, float &pitchCmd, float &rollCmd);
 
 static inline void resetLaunchState() {
   launchDetected        = false;
@@ -139,8 +171,10 @@ static inline void resetLaunchState() {
   q_body                = {1,0,0,0};
   vel_world             = {0,0,0};
   velDir_world          = {0,1,0};
+  launchAxis_world      = {0,1,0};
   lastGyroUpdateUs      = 0;
   lastVelUpdateUs       = 0;
+  updateMotorCommand(0.0f, 0.0f, 0.0f, 0.0f);
 }
 
 void pd_setup_impl() {
@@ -160,6 +194,8 @@ void pd_setup_impl() {
 
   ser.begin();
   Serial.println("IQ serial initialized");
+  telemetryStartAP();
+  updateMotorCommand(0.0f, 0.0f, 0.0f, 0.0f);
 }
 
 void pd_loop_impl() {
@@ -178,7 +214,7 @@ void pd_loop_impl() {
 
   // --- Read IMU quaternion (idle + acceleration phase, for gravity capture & burnout snapshot) ---
   // Quaternion: q[0]=w, q[1]=x, q[2]=y, q[3]=z, scaled /32768
-  if (!launchDetected) {
+  if (!launchDetected && !launchSpikeSeen) {
     JY901.GetQuaternion();
     Quat q_imu = quatNorm(Quat{
       (float)JY901.stcQuater.q0 * QUAT_SCALE,
@@ -238,30 +274,71 @@ void pd_loop_impl() {
           ambientConfirmCount = 0;
           // Begin integrating velocity over the acceleration phase only.
           vel_world = {0,0,0};
-          lastVelUpdateUs = micros();
+          q_body = candidateQuat;
+          launchAxis_world = vecNormalizeOrFallback(quatRotVec(candidateQuat, Vec3{0,1,0}), vecScale(gravity_world, -1.0f));
+          if (vecDot(launchAxis_world, gravity_world) > 0.0f) {
+            launchAxis_world = vecScale(launchAxis_world, -1.0f);
+          }
+          lastGyroUpdateUs = micros();
+          lastVelUpdateUs = lastGyroUpdateUs;
           Serial.println("Burn detected: integrating velocity until accel returns to ambient for ballistic launch.");
         }
       } else {
         launchConfirmCount = 0;
       }
     } else {
-      // --- Acceleration phase: integrate world-frame velocity ---
+      // --- Acceleration phase: integrate body orientation and world-frame velocity ---
       // accel_* is specific force (in g). Linear acceleration = specific_force_world + gravity_world.
       // gravity_world is unit "down". At rest: specific_force_world ≈ -gravity_world -> linear ≈ 0.
       unsigned long nowUs = micros();
       float dt = (nowUs - lastVelUpdateUs) * 1e-6f;
+      float dt_gyro = 0.0f;
+      if (lastGyroUpdateUs != 0) {
+        dt_gyro = (nowUs - lastGyroUpdateUs) * 1e-6f;
+      }
+      if (dt_gyro > 0.0f && dt_gyro < 0.05f) {
+        q_body = integrateGyro(q_body, wx, wy, wz, dt_gyro);
+      }
+      lastGyroUpdateUs = nowUs;
       lastVelUpdateUs = nowUs;
       if (dt > 0.0f && dt < 0.05f) {
+        // Use raw accelerometer specific force as provided by IMU (in g), rotate into world.
         Vec3 accel_body_g = {ax, ay, az};
-        Vec3 specific_force_world_g = quatRotVec(candidateQuat, accel_body_g);
+        Vec3 specific_force_world_g = quatRotVec(q_body, accel_body_g);
+        // store for telemetry diagnosis
+        lastAccelBody_g = accel_body_g;
+        lastSpecificForceWorld_g = specific_force_world_g;
         Vec3 linear_accel_world_mps2 = {
           (specific_force_world_g.x + gravity_world.x) * G_MPS2,
           (specific_force_world_g.y + gravity_world.y) * G_MPS2,
           (specific_force_world_g.z + gravity_world.z) * G_MPS2
         };
-        vel_world.x += linear_accel_world_mps2.x * dt;
-        vel_world.y += linear_accel_world_mps2.y * dt;
-        vel_world.z += linear_accel_world_mps2.z * dt;
+        // apply and record
+        lastLinearAccel_mps2 = linear_accel_world_mps2;
+        lastDeltaVel_mps = { linear_accel_world_mps2.x * dt, linear_accel_world_mps2.y * dt, linear_accel_world_mps2.z * dt };
+        vel_world.x += lastDeltaVel_mps.x;
+        vel_world.y += lastDeltaVel_mps.y;
+        vel_world.z += lastDeltaVel_mps.z;
+      }
+
+      // Emit high-rate burn telemetry while in the acceleration phase to aid capture
+      {
+        unsigned long nowMs = millis();
+        float launchAccel = vecDot(lastLinearAccel_mps2, launchAxis_world);
+        float launchVel = vecDot(vel_world, launchAxis_world);
+        char burnBuf[640];
+        snprintf(burnBuf, sizeof(burnBuf), "{\"t\":%lu,\"type\":\"burn\",\"launch_candidate_ms\":%lu,\"quat\":[%.6f,%.6f,%.6f,%.6f],\"accelBody\":[%.6f,%.6f,%.6f],\"specificForceWorld\":[%.6f,%.6f,%.6f],\"linearAccel_mps2\":[%.6f,%.6f,%.6f],\"launchAccel_mps2\":%.6f,\"deltaVel_mps\":[%.6f,%.6f,%.6f],\"launchVel_mps\":%.6f,\"dt\":%.6f}",
+                 nowMs, candidateLaunchTimeMs,
+                 q_body.w, q_body.x, q_body.y, q_body.z,
+                 lastAccelBody_g.x, lastAccelBody_g.y, lastAccelBody_g.z,
+                 lastSpecificForceWorld_g.x, lastSpecificForceWorld_g.y, lastSpecificForceWorld_g.z,
+                 lastLinearAccel_mps2.x, lastLinearAccel_mps2.y, lastLinearAccel_mps2.z,
+                 launchAccel,
+                 lastDeltaVel_mps.x, lastDeltaVel_mps.y, lastDeltaVel_mps.z,
+                 launchVel,
+                 dt);
+        Serial.println(burnBuf);
+        telemetrySend(burnBuf);
       }
 
       if (currentAccelG <= AMBIENT_ACCEL_THRESHOLD_G) {
@@ -274,20 +351,29 @@ void pd_loop_impl() {
           launchDetected = true;
           launchTimeMs   = candidateLaunchTimeMs;
 
-          // Initialize body quaternion from IMU snapshot at burnout
-          q_body = candidateQuat;
+          // Keep the current integrated body quaternion at burnout.
+          // q_body has been integrated during the burn phase.
 
-          // vel_world has been integrated over the acceleration phase; use it as initial ballistic velocity.
-          float vLen = sqrtf(vel_world.x*vel_world.x + vel_world.y*vel_world.y + vel_world.z*vel_world.z);
-          velDir_world = (vLen > 1e-6f) ? Vec3{vel_world.x/vLen, vel_world.y/vLen, vel_world.z/vLen} : Vec3{0,1,0};
+          float vLen = vecNorm(vel_world);
+          if (vLen < MIN_INTEGRATED_LAUNCH_SPEED_MPS || vecDot(vel_world, launchAxis_world) < 0.0f) {
+            float launchSpeed = (vLen > MIN_INTEGRATED_LAUNCH_SPEED_MPS) ? vLen : MIN_INTEGRATED_LAUNCH_SPEED_MPS;
+            vel_world = vecScale(launchAxis_world, launchSpeed);
+            vLen = vecNorm(vel_world);
+          }
+          velDir_world = (vLen > 1e-6f) ? Vec3{vel_world.x/vLen, vel_world.y/vLen, vel_world.z/vLen} : launchAxis_world;
 
           lastGyroUpdateUs = micros();
           lastVelUpdateUs  = micros();
 
-          Serial.printf("Ballistic start at %lu ms. velDir: %.2f,%.2f,%.2f gravity: %.2f,%.2f,%.2f\n",
+          float launchProjVel = vecDot(vel_world, launchAxis_world);
+          float launchProjAccel = vecDot(lastLinearAccel_mps2, launchAxis_world);
+          Serial.printf("Ballistic start at %lu ms. launchAxis=%.2f,%.2f,%.2f velDir=%.2f,%.2f,%.2f grav=%.2f,%.2f,%.2f launchVel=%.3f launchAccel=%.3f\n",
                         launchTimeMs,
+                        launchAxis_world.x, launchAxis_world.y, launchAxis_world.z,
                         velDir_world.x, velDir_world.y, velDir_world.z,
-                        gravity_world.x, gravity_world.y, gravity_world.z);
+                        gravity_world.x, gravity_world.y, gravity_world.z,
+                        launchProjVel,
+                        launchProjAccel);
         }
       } else {
         ambientConfirmCount = 0;
@@ -310,13 +396,21 @@ void pd_loop_impl() {
     // 2. Evolve velocity vector under constant gravity
     float dt_vel = (nowUs - lastVelUpdateUs) * 1e-6f;
     lastVelUpdateUs = nowUs;
-    vel_world.x += gravity_world.x * G_MPS2 * dt_vel;
-    vel_world.y += gravity_world.y * G_MPS2 * dt_vel;
-    vel_world.z += gravity_world.z * G_MPS2 * dt_vel;
+    // gravity-only evolution during ballistic
+    Vec3 gravityAccel = { gravity_world.x * G_MPS2, gravity_world.y * G_MPS2, gravity_world.z * G_MPS2 };
+    lastLinearAccel_mps2 = gravityAccel;
+    lastDeltaVel_mps = { gravityAccel.x * dt_vel, gravityAccel.y * dt_vel, gravityAccel.z * dt_vel };
+    vel_world.x += lastDeltaVel_mps.x;
+    vel_world.y += lastDeltaVel_mps.y;
+    vel_world.z += lastDeltaVel_mps.z;
 
     // 3. Normalize to get current velocity direction
     float vLen = sqrtf(vel_world.x*vel_world.x + vel_world.y*vel_world.y + vel_world.z*vel_world.z);
-    if (vLen > 1e-3f) velDir_world = {vel_world.x/vLen, vel_world.y/vLen, vel_world.z/vLen};
+    if (vLen > 1e-3f) {
+      velDir_world = {vel_world.x/vLen, vel_world.y/vLen, vel_world.z/vLen};
+    }
+    lastBallisticDt = dt_vel;
+    lastBallisticSpeed = vLen;
 
     // 4. Target: selected body Y direction points along velocity direction.
     Vec3 targetBodyY = {
@@ -349,22 +443,50 @@ void pd_loop_impl() {
     cmd_ez = (fabs(ez_err) >= ANGLE_DEADBAND_DEG) ? ez_err : 0.0f;
   }
 
-  updateMotorCommand(cmd_ex, cmd_ez, wx, wz);
+  if (launchDetected) {
+    updateMotorCommand(cmd_ex, cmd_ez, wx, wz);
+  } else {
+    updateMotorCommand(0.0f, 0.0f, 0.0f, 0.0f);
+  }
 
   // --- Telemetry ---
   unsigned long now = millis();
   if (now - lastTelemetryTime >= TELEMETRY_INTERVAL_MS) {
     lastTelemetryTime = now;
     if (launchDetected) {
-      float cmd1 = constrain(KP*(-cmd_ex - cmd_ez) - KD*(-wx - wz), -MAX_MOTOR_VELOCITY, MAX_MOTOR_VELOCITY);
-      float cmd0 = constrain(KP*( cmd_ex - cmd_ez) - KD*( wx - wz), -MAX_MOTOR_VELOCITY, MAX_MOTOR_VELOCITY);
-      Serial.printf("BALLISTIC: velDir=%.2f,%.2f,%.2f ex=%.1f ez=%.1f -> m1=%.1f m0=%.1f\n",
+      float pitchCmd = 0.0f;
+      float rollCmd = 0.0f;
+      computeMotorCommands(cmd_ex, cmd_ez, wx, wz, pitchCmd, rollCmd);
+      Serial.printf("BALLISTIC: dt=%.4f vel=%.2f,%.2f,%.2f | speed=%.2f dir=%.2f,%.2f,%.2f grav=%.2f,%.2f,%.2f ex=%.1f ez=%.1f -> pitch=%.1f roll=%.1f\n",
+                    lastBallisticDt,
+                    vel_world.x, vel_world.y, vel_world.z,
+                    lastBallisticSpeed,
                     velDir_world.x, velDir_world.y, velDir_world.z,
-                    cmd_ex, cmd_ez, cmd1, cmd0);
+                    gravity_world.x, gravity_world.y, gravity_world.z,
+                    cmd_ex, cmd_ez, pitchCmd, rollCmd);
+      char buf[1024];
+      // Include launchAxis, lastBallisticDt, and diagnostic accel/specific-force for debugging
+      snprintf(buf, sizeof(buf), "{\"t\":%lu,\"type\":\"ballistic\",\"launch_ms\":%lu,\"quat\":[%.6f,%.6f,%.6f,%.6f],\"vel\":[%.6f,%.6f,%.6f],\"velDir\":[%.6f,%.6f,%.6f],\"launchAxis\":[%.6f,%.6f,%.6f],\"gravity\":[%.6f,%.6f,%.6f],\"accelBody\":[%.6f,%.6f,%.6f],\"specificForceWorld\":[%.6f,%.6f,%.6f],\"linearAccel_mps2\":[%.6f,%.6f,%.6f],\"deltaVel_mps\":[%.6f,%.6f,%.6f],\"dt\":%.6f}",
+           now, launchTimeMs,
+           q_body.w, q_body.x, q_body.y, q_body.z,
+           vel_world.x, vel_world.y, vel_world.z,
+           velDir_world.x, velDir_world.y, velDir_world.z,
+           launchAxis_world.x, launchAxis_world.y, launchAxis_world.z,
+           gravity_world.x, gravity_world.y, gravity_world.z,
+           lastAccelBody_g.x, lastAccelBody_g.y, lastAccelBody_g.z,
+           lastSpecificForceWorld_g.x, lastSpecificForceWorld_g.y, lastSpecificForceWorld_g.z,
+           lastLinearAccel_mps2.x, lastLinearAccel_mps2.y, lastLinearAccel_mps2.z,
+           lastDeltaVel_mps.x, lastDeltaVel_mps.y, lastDeltaVel_mps.z,
+           lastBallisticDt);
+      Serial.println(buf);
+      telemetrySend(buf);
     } else {
       Serial.printf("WAITING: accel=%.2fg grav=%.2f,%.2f,%.2f\n",
                     currentAccelG,
                     gravity_world.x, gravity_world.y, gravity_world.z);
+      char buf[128];
+      snprintf(buf, sizeof(buf), "{\"t\":%lu,\"type\":\"waiting\",\"accel\":%.6f}", now, currentAccelG);
+      telemetrySend(buf);
     }
   }
 }
@@ -373,10 +495,18 @@ void updateMotorCommand(float ex, float ez, float wx, float wz) {
   // Motor 1 axis: (-X -Z)/sqrt2  →  cmd1 = -KP*(ex+ez) - KD*(wx+wz) projected
   // Motor 0 axis: (+X -Z)/sqrt2  →  cmd0 =  KP*(ex-ez) - KD*(wx-wz) projected
   // sqrt(2) absorbed into KP/KD
+  float pitchCmd = 0.0f;
+  float rollCmd = 0.0f;
+  computeMotorCommands(ex, ez, wx, wz, pitchCmd, rollCmd);
+  ser.set(pitch_control.ctrl_velocity_, pitchCmd);
+  ser.set(roll_control.ctrl_velocity_, rollCmd);
+}
+
+void computeMotorCommands(float ex, float ez, float wx, float wz, float &pitchCmd, float &rollCmd) { 
   float cmd1 = constrain(KP*(-ex - ez) - KD*(-wx - wz), -MAX_MOTOR_VELOCITY, MAX_MOTOR_VELOCITY);
   float cmd0 = constrain(KP*( ex - ez) - KD*( wx - wz), -MAX_MOTOR_VELOCITY, MAX_MOTOR_VELOCITY);
-  ser.set(pitch_control.ctrl_velocity_, cmd1);
-  ser.set(roll_control.ctrl_velocity_,  -cmd0);
+  pitchCmd = -cmd1;
+  rollCmd = -cmd0;
 }
 
 }

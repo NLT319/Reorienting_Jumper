@@ -1,0 +1,27 @@
+Processing seeed_xiao_esp32c3 (platform: espressif32; board: seeed_xiao_esp32c3; framework: arduino)
+--------------------------------------------------------------------------------
+Verbose mode can be enabled via `-v, --verbose` option
+CONFIGURATION: https://docs.platformio.org/page/boards/espressif32/seeed_xiao_esp32c3.html
+PLATFORM: Espressif 32 (6.13.0) > Seeed Studio XIAO ESP32C3
+HARDWARE: ESP32C3 160MHz, 320KB RAM, 4MB Flash
+DEBUG: Current (cmsis-dap) External (cmsis-dap, esp-bridge, esp-builtin, esp-prog, iot-bus-jtag, jlink, minimodule, olimex-arm-usb-ocd, olimex-arm-usb-ocd-h, olimex-arm-usb-tiny-h, olimex-jtag-tiny, tumpa)
+PACKAGES: 
+ - framework-arduinoespressif32 @ 3.20017.241212+sha.dcc1105b 
+ - tool-esptoolpy @ 2.41100.0 (4.11.0) 
+ - toolchain-riscv32-esp @ 8.4.0+2021r2-patch5
+LDF: Library Dependency Finder -> https://bit.ly/configure-pio-ldf
+LDF Modes: Finder ~ chain, Compatibility ~ soft
+Found 35 compatible libraries
+Scanning dependencies...
+Dependency Graph
+|-- IQ Module Communication @ 1.5.0
+|-- JY901
+|-- Wire @ 2.0.0
+|-- WiFi @ 2.0.0
+Building in release mode
+Retrieving maximum program size .pio\build\seeed_xiao_esp32c3\firmware.elf
+Checking size .pio\build\seeed_xiao_esp32c3\firmware.elf
+Advanced Memory Usage is available via "PlatformIO Home > Project Inspect"
+RAM:   [=         ]  12.4% (used 40620 bytes from 327680 bytes)
+Flash: [======    ]  59.2% (used 775640 bytes from 1310720 bytes)
+========================= [SUCCESS] Took 4.67 seconds =========================
