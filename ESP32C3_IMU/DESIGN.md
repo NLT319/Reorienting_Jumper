@@ -24,6 +24,7 @@ This document is primarily for developers working on the flight controller and t
 - **IMU Sensor**: JY901 (9-DOF: 3-axis accelerometer, 3-axis gyroscope, 3-axis magnetometer, quaternion output)
 - **Communication**: I2C (IMU data), Serial (motor commands via IQ module)
 - **Motors**: 2x IQ modules controlled via serial protocol (MultiTurnAngleControlClient)
+- **Power**: 550 mAh 130C LiPo battery (11.1 V, 6.105 Wh) is recommended for stable launch power and consistent motor performance.
 - **Input**: Digital push-button (pin 2) for launch reset
 
 ### Key I/O Pins
