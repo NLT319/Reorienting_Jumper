@@ -308,6 +308,7 @@ Clamped to: [-199, +199] motor units
 
 **Tunable Gains**:
 - `KP = 1.0`: Proportional gain (motor units per degree) — implemented value in `PD_controlled.cpp`
+ - `KP = 2.0`: Proportional gain (motor units per degree) — implemented value in `PD_controlled.cpp`
 - `KD = 0.08`: Derivative gain (motor units per deg/s) — implemented value in `PD_controlled.cpp`
 - `ANGLE_DEADBAND_DEG = 1.5°`: Minimum error to command
 
